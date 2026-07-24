@@ -253,6 +253,17 @@ var Player = (function () {
      * is unreliable. */
     function startExternalSubtitle(sub) {
         stopExternalSubtitle();
+        // Incremental embedded tracks publish one stable cue array up front.
+        // Keep that reference so the poller automatically sees cues appended
+        // by the background scanner without rewriting a growing SRT file.
+        if (sub && Array.isArray(sub.cues)) {
+            extCues = sub.cues;
+            extLastCueIdx = -1;
+            extPollTimer = setInterval(extPoll, 250);
+            if (typeof Debug !== 'undefined')
+                Debug.player('live extracted sub selected: ' + extCues.length + ' cues scanned so far');
+            return;
+        }
         if (!sub || typeof Browser === 'undefined' || !Browser.readSubtitleText) return;
         Browser.readSubtitleText(sub, function (err, text) {
             if (err) {
@@ -579,6 +590,7 @@ var Player = (function () {
                      * own renderer silent so only our overlay shows.  (The CC
                      * menu and applyLanguagePreferences use the same path
                      * mid-playback.) */
+                    applyAvSubtitleLanguageHintsToExtractedMp4();
                     if (typeof Settings !== 'undefined') {
                         var pref = Settings.get('subtitleLang');
                         var sub  = pickBestExternalSubtitle(pref);
@@ -614,6 +626,7 @@ var Player = (function () {
     }
     var h5OpenWatchdog = null;
     var playerSubtitles = [];   // sibling subtitle files, regardless of backend
+    var lastAvTrackInfoLog = '';
     /* Legacy alias — older code paths used h5Subtitles directly */
     var h5Subtitles = playerSubtitles;
     function h5Open(url, opts) {
@@ -723,7 +736,15 @@ var Player = (function () {
      * extracted, we apply it after the fact via applyExternalSubtitleLive(),
      * which renders without seeking the playhead. */
     var lastExtractToken = 0;
-    function extractAndAppendEmbeddedSubs(url) {
+    var activeEmbeddedSubExtraction = null;
+    function cancelEmbeddedSubExtraction(reason) {
+        ++lastExtractToken;
+        if (activeEmbeddedSubExtraction && activeEmbeddedSubExtraction.cancel) {
+            activeEmbeddedSubExtraction.cancel(reason);
+        }
+        activeEmbeddedSubExtraction = null;
+    }
+    function extractAndAppendEmbeddedSubs(url, file) {
         var lower = String(url || '').toLowerCase().split('?')[0];
         var extractor, label;
         if (/\.mp4$|\.m4v$|\.mov$/.test(lower) && typeof Mp4Subs !== 'undefined') {
@@ -736,6 +757,73 @@ var Player = (function () {
 
         var token = ++lastExtractToken;
         if (typeof Debug !== 'undefined') Debug.player(label + ' sub extract: starting on ' + url);
+
+        if (extractor.extractIncremental) {
+            var entriesByTrack = {};
+            activeEmbeddedSubExtraction = extractor.extractIncremental(file || url, {
+                onTracks: function (tracks) {
+                    if (token !== lastExtractToken) return;
+                    var languageHints = label === 'MP4' ? getAvSubtitleLanguageHints() : [];
+                    for (var i = 0; i < tracks.length; i++) {
+                        var s = tracks[i];
+                        var hintedLang = languageHints[i] && languageHints[i].lang;
+                        var entry = {
+                            name: 'Embedded subtitle ' + (i + 1) + ' (' + label + ', scanning)',
+                            lang: hintedLang || s.lang || '',
+                            ext: 'srt',
+                            _extracted: true,
+                            _incremental: true,
+                            _containerLabel: label,
+                            _trackId: s.id,
+                            _nativeTextIndex: languageHints[i] && languageHints[i].index,
+                            _cueCount: 0,
+                            cues: s.cues
+                        };
+                        if (hintedLang && hintedLang !== s.lang && typeof Debug !== 'undefined') {
+                            Debug.player(label + ' sub extract: language hint track ' + s.id +
+                                         ' → ' + hintedLang + ' from AVPlay TEXT#' + entry._nativeTextIndex);
+                        }
+                        entriesByTrack[s.id] = entry;
+                        playerSubtitles.push(entry);
+                    }
+                    h5Subtitles = playerSubtitles;
+                    emit('onsubsupdated');
+                    // The language preference may select the live track now;
+                    // its poller will begin rendering as cues arrive.
+                    if (tracks.length) onMp4SubExtractionDone();
+                },
+                onCues: function (trackId, cues) {
+                    if (token !== lastExtractToken) return;
+                    var entry = entriesByTrack[trackId];
+                    if (entry) entry._cueCount = cues.length;
+                },
+                onProgress: function (processed, total) {
+                    if (token !== lastExtractToken || !total) return;
+                    var pct = Math.floor(processed * 100 / total);
+                    for (var key in entriesByTrack)
+                        entriesByTrack[key].name = entriesByTrack[key].name.replace(/, scanning(?: \d+%)?/, ', scanning ' + pct + '%');
+                },
+                onComplete: function () {
+                    if (token !== lastExtractToken) return;
+                    activeEmbeddedSubExtraction = null;
+                    for (var key in entriesByTrack) {
+                        var entry = entriesByTrack[key];
+                        entry.name = entry.name.replace(/, scanning(?: \d+%)?/, '');
+                        entry._cueCount = entry.cues.length;
+                    }
+                    emit('onsubsupdated');
+                },
+                onError: function (err) {
+                    if (token !== lastExtractToken) return;
+                    activeEmbeddedSubExtraction = null;
+                    for (var key in entriesByTrack)
+                        entriesByTrack[key].name = entriesByTrack[key].name.replace(/, scanning(?: \d+%)?/, ', partial');
+                    emit('onsubsupdated');
+                    if (typeof Debug !== 'undefined') Debug.warn(label + ' incremental sub extract failed: ' + (err.message || err));
+                }
+            });
+            return;
+        }
         extractor.extract(url, function (err, subs) {
             if (token !== lastExtractToken) return;
             if (err) {
@@ -765,6 +853,7 @@ var Player = (function () {
                             uri:        rec.uri,
                             fullPath:   rec.fullPath,
                             _extracted: true,
+                            _containerLabel: label,
                             _cueCount:  s.cues.length
                         });
                         if (typeof Debug !== 'undefined')
@@ -802,6 +891,7 @@ var Player = (function () {
 
     function open(url, opts) {
         opts = opts || {};
+        cancelEmbeddedSubExtraction('opening another file');
         playerSubtitles = (opts.subtitles) ? opts.subtitles.slice() : [];
         h5Subtitles = playerSubtitles;
         stopExternalSubtitle();    // clear any previous file's poller
@@ -831,7 +921,7 @@ var Player = (function () {
                 // subtitle tracks (MP4 / MKV / WebM) and route them through
                 // the working external-subtitle pipeline.  No-op for
                 // unsupported containers.
-                extractAndAppendEmbeddedSubs(url);
+                extractAndAppendEmbeddedSubs(url, opts.file);
 
                 avOpen(url, function (reason) {
                     // For MKV there's no point falling back to the HTML5
@@ -882,6 +972,7 @@ var Player = (function () {
     }
     function stop() {
         clearTimeout(h5OpenWatchdog);
+        cancelEmbeddedSubExtraction('playback stopped');
         stopExternalSubtitle();
         hideSubtitleText();
         currentExternalSub = null;
@@ -1006,13 +1097,82 @@ var Player = (function () {
             var m = s.match(/\b([a-z]{2,3})\b/i);
             return { label: s, lang: m ? m[1].toLowerCase() : '', codec: s };
         }
-        var lang  = (obj.language || obj.lang || '').toString().toLowerCase();
+        var lang  = (obj.language || obj.lang || obj.track_lang || '').toString().toLowerCase();
         var codec = (obj.fourCC || obj.codec || '').toString();
         var parts = [];
         if (lang) parts.push(lang.toUpperCase());
         if (codec) parts.push(codec);
         if (obj.channels) parts.push(obj.channels + 'ch');
         return { label: parts.join(' · ') || s, lang: lang, codec: codec };
+    }
+
+    function logAvTrackInfo(info) {
+        if (typeof Debug === 'undefined' || !info || !info.length) return;
+
+        var parts = [];
+        for (var i = 0; i < info.length; i++) {
+            var t = info[i];
+            var parsed = parseAvExtraInfo(t.extra_info);
+            var part = t.type + '#' + t.index;
+            if (parsed.lang) part += ' lang=' + parsed.lang;
+            if (parsed.codec) part += ' codec=' + parsed.codec;
+            if (t.type === 'TEXT' || t.type === 'SUBTITLE') {
+                part += ' extra=' + JSON.stringify(String(t.extra_info || '').slice(0, 160));
+            }
+            parts.push(part);
+        }
+
+        var signature = parts.join(' | ');
+        if (signature === lastAvTrackInfoLog) return;
+        lastAvTrackInfoLog = signature;
+        Debug.player('AV tracks: ' + signature);
+    }
+
+    function getAvSubtitleLanguageHints() {
+        var hints = [];
+        try {
+            var info = av().getTotalTrackInfo();
+            logAvTrackInfo(info);
+
+            for (var i = 0; i < info.length; i++) {
+                var t = info[i];
+                if (t.type !== 'TEXT' && t.type !== 'SUBTITLE') continue;
+
+                var parsed = parseAvExtraInfo(t.extra_info);
+                hints.push({
+                    index: t.index,
+                    lang: parsed.lang || '',
+                    codec: parsed.codec || ''
+                });
+            }
+        } catch (e) {}
+
+        return hints;
+    }
+
+    function applyAvSubtitleLanguageHintsToExtractedMp4() {
+        if (!playerSubtitles || !playerSubtitles.length) return;
+
+        var hints = getAvSubtitleLanguageHints();
+        if (!hints.length) return;
+
+        var hintIndex = 0;
+        for (var i = 0; i < playerSubtitles.length; i++) {
+            var sub = playerSubtitles[i];
+            if (!sub || !sub._extracted || sub._containerLabel !== 'MP4') continue;
+
+            var hint = hints[hintIndex++];
+            if (!hint) continue;
+
+            sub._nativeTextIndex = hint.index;
+            if (hint.lang && sub.lang !== hint.lang) {
+                if (typeof Debug !== 'undefined') {
+                    Debug.player('MP4 sub extract: language hint ' + sub.name +
+                                 ' → ' + hint.lang + ' from AVPlay TEXT#' + hint.index);
+                }
+                sub.lang = hint.lang;
+            }
+        }
     }
 
     /* ── Track info ─────────────────────────────────────────────────────
@@ -1056,6 +1216,7 @@ var Player = (function () {
 
             try {
                 var info = av().getTotalTrackInfo();
+                logAvTrackInfo(info);
                 for (var i = 0; i < info.length; i++) {
                     var t = info[i];
                     var parsed = parseAvExtraInfo(t.extra_info);

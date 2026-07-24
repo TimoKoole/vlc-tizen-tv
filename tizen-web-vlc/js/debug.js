@@ -8,6 +8,7 @@
  */
 
 var Debug = (function () {
+    var BUILD_LABEL = 'CUSTOM large-mp4-subtitles 2026-07-24';
     var CFG_KEY = 'vlctv_debug_v1';
     var startTs = Date.now();
     var seq     = 0;
@@ -110,7 +111,8 @@ var Debug = (function () {
     /* Boot banner — confirms the app loaded + the build it's from (only sent
      * when logging is enabled and an endpoint is set). */
     send('BOOT',
-         'VLC TV starting; UA=' + navigator.userAgent +
+         'VLC TV starting; build=' + BUILD_LABEL +
+         '; UA=' + navigator.userAgent +
          '; href=' + location.href);
 
     return {
